@@ -1,0 +1,280 @@
+## Short-Read Data Processing
+
+This pipeline describes the steps to process raw and/or clean data generated with a DNB (DNA nanoball) sequencing platform, but it can generally be applied to data from other short-read sequencing technologies as well.
+
+### Library Preparation and Sequencing
+
+- **Input material:** 30 ng of qualified DNA template.
+- **Targeted region:** 16S rRNA, V3–V4 region.
+- **Amplification:** PCR performed using fusion primers.
+- **Purification:** PCR products are purified using Agencourt AMPure XP beads and dissolved in Elution Buffer.
+- **Library QC:** Library size and concentration are measured using an Agilent 2100 Bioanalyzer.
+- **Sequencing:** Qualified libraries are sequenced on the DNB platform according to their insert size, producing paired-end reads.
+
+---
+
+### Data Types
+
+Two types of data were provided:
+
+- **Raw data:** Unprocessed FASTQ files directly from the sequencer.
+- **Clean data:** High-quality reads obtained after filtering and preprocessing of the raw data.
+
+---
+
+### Raw Data Filtering
+
+The raw reads were processed to generate **clean data** through the following steps:
+
+1. **Adapter and primer removal**  
+   Trim adapter and primer contamination using `cutadapt`.
+
+2. **Quality filtering**  
+   - Apply a sliding window of 30 bp and truncate reads with an average Phred quality score < 20.
+   - Remove reads that are shorter than 75% of their original length after truncation.
+
+3. **Ambiguity filtering**  
+   Discard reads containing ambiguous bases (N).
+
+4. **Low-complexity filtering**  
+   Remove reads with low sequence complexity (by default, reads containing ≥10 consecutive identical bases).
+
+---
+
+### Data Filtering Report
+
+BGI provided a filtering summary for each sample, including the following metrics:
+
+| Column | Meaning |
+|-------|---------|
+| **SampleNum** | Internal sample identifier. |
+| **SampleName** | Sample name as provided by the client. |
+| **Length** | Read length for forward and reverse reads (bp). |
+| **Raw** | Total amount of raw data (Mbp) before filtering. |
+| **Ploy** | Percentage of poly-base or low-complexity reads removed. |
+| **LowQ** | Percentage of reads removed due to low quality (Q < 20 over 30 bp sliding window). |
+| **Clean** | Total amount of clean data (Mbp) after filtering. |
+| **DUR** | Data Utilization Ratio: (Clean / Raw) × 100. |
+
+**Example:** For sample 23 (PE300), 97.93 % of raw data passed filtering, indicating excellent sequencing quality.
+
+---
+
+### Clean Data
+
+After filtering, the resulting clean data were provided in **paired-end format**.  
+For each sample, two FASTQ files are available:
+
+- `<sample>_1.gz.fq` → forward reads (R1)
+- `<sample>_2.gz.fq` → reverse reads (R2)
+
+Paired-end reads provide higher mapping accuracy and allow overlapping reads to be merged into **tags**, which improves downstream analysis such as OTU/ASV clustering or taxonomic classification.
+
+Paired-end reads were merged using **FLASH** with the following parameters:  
+- Minimum overlap: 15 bp  
+- Maximum mismatch ratio in the overlap: ≤ 0.1  
+Reads that did not meet these criteria were kept as separate forward (R1) and reverse (R2) reads.
+
+### Visualization of quality plots using FASTQC
+
+Unzip a folder which contains the fasta (fa) and fastq (fq) Tag files for each sample.
+
+`unzip Tag.zip`
+
+Create a conda enviornment and install fastqc.
+
+`conda create -n fastqc`
+`conda activate fastqc`
+`conda install -c bioconda fastqc`
+`fastqc --version`                                              *FastQC v0.12.1* 
+
+Create a folder in which store all FastQC Reports generated and create reports
+`mkdir FastQC_Reports`
+`fastqc Tag/*.fq.gz -o FastQC_Reports`
+
+### Visualization of quality plots using MULTIQC
+
+Install multiqc
+
+`conda create -n multiqc_env python=3.9`
+`conda activate multiqc_env`
+`mamba install -c bioconda multiqc`
+
+MultiQC merges all FastQC reports in just one HTML.
+
+`multiqc FastQC_Reports/ -o MultiQC_Report`
+
+MultiQC_Report/multiqc_data        → datos de resumen en formato tabular
+MultiQC_Report/multiqc_report.html → reporte HTML interactivo
+
+`open MultiQC_Report/multiqc_report.html`
+
+## Chimera removal
+
+Chimeric sequences are artificial sequences that can arise during PCR amplification when two or more parental sequences are combined. These artifacts can lead to false positive taxa and inflated diversity estimates in microbial community analyses.
+
+To ensure data quality, chimera removal was performed on cleaned 16S sequences in FASTA format (.fa.gz) using VSEARCH v2.30.0 with the --uchime_denovo algorithm. This method detects chimeras de novo based on sequence abundance and k-mer patterns, without requiring a reference database.
+
+### Install VSEARCH
+
+`conda create -n vsearch_env -c bioconda -c conda-forge vsearch`
+`conda activate vsearch_env`
+`vsearch --version`
+
+If succesfully installed, you should see:
+
+vsearch v2.30.0_macos_x86_64, 8.0GB RAM, 8 cores
+https://github.com/torognes/vsearch
+
+Rognes T, Flouri T, Nichols B, Quince C, Mahe F (2016)
+VSEARCH: a versatile open source tool for metagenomics
+PeerJ 4:e2584 doi: 10.7717/peerj.2584 https://doi.org/10.7717/peerj.2584
+
+Compiled with support for gzip-compressed files, and the library is loaded.
+zlib version 1.3.1, compile flags a9
+Compiled with support for bzip2-compressed files, and the library is loaded.
+
+Input: Cleaned 16S sequences in FASTQ format (.fa.gz), after adapter and primer removal and quality filtering.
+
+Output:
+
+*.nochim.fa → sequences identified as non-chimeric (retained for analysis)
+
+*.chimeras.fa → sequences identified as chimeric (removed)
+
+*.uchime.txt → detailed report of chimera detection
+
+Create an ouput folder: `mkdir NoChimera`
+
+### Loop over all .fa.gz files in the Tag folder
+
+```bash
+INPUT_DIR="/Users/marisabelcharlocabrera/Desktop/Short_Read_Feaces/Tag"
+OUTPUT_DIR="/Users/marisabelcharlocabrera/Desktop/Short_Read_Feaces/NoChimera"
+    
+cd "$INPUT_DIR" || exit
+
+echo "🔹 Chimera removal starting ..."
+
+# 1️⃣ Quitar quimeras de cada archivo FASTQ (salida FASTA)
+for fq in *.FinalTag.fq.gz
+do
+    sample=$(basename "$fq" .FinalTag.fq.gz)
+    echo "🔄 Eliminando quimeras para $sample"
+
+    # Salida en la carpeta OUTPUT_DIR
+    vsearch --uchime_denovo "$fq" \
+        --nonchimeras "$OUTPUT_DIR/${sample}.nochim.fa" \
+        --chimeras "$OUTPUT_DIR/${sample}.chimeras.fa" \
+        --uchimeout "$OUTPUT_DIR/${sample}.uchime.txt"
+done
+
+echo "✅ Chimera removal complete."
+
+# 2️⃣ Extraer IDs de secuencias no quiméricas
+echo "🔹 Extrayendo IDs de secuencias no quiméricas ..."
+cd "$OUTPUT_DIR" || exit
+for fa in *.nochim.fa
+do
+    grep "^>" "$fa" | sed 's/^>//' > "${fa%.fa}_ids.txt"
+done
+
+conda activate seqtk_env
+
+# 3️⃣ Filtrar FASTQ original para quedarnos solo con secuencias no quiméricas
+echo "🔹 Filtrando FASTQ original según IDs ..."
+cd "$INPUT_DIR" || exit
+for fq in *.FinalTag.fq.gz
+do
+    sample=$(basename "$fq" .FinalTag.fq.gz)
+    echo "📑 Generando FASTQ sin quimeras para $sample"
+    seqtk subseq "$fq" "$OUTPUT_DIR/${sample}.nochim_ids.txt" > "$OUTPUT_DIR/${sample}.nochim.fq"
+done
+
+echo "✅ FASTQ sin quimeras generados en $OUTPUT_DIR"
+```
+
+## Dereplication of non-chimeric sequences
+
+After chimera removal, the next step is **dereplication**, which consists of identifying and collapsing identical sequences into a single representative sequence while keeping track of their abundance.
+
+### Why do we do dereplication?
+
+1. **Reduces dataset size**, speeding up downstream analyses.  
+2. **Removes redundancy**, as identical sequences do not provide extra information.  
+3. **Prepares data for taxonomic assignment**, which often uses sequence abundance information.
+
+### How dereplication works
+
+We use `vsearch` to perform full-length dereplication. Each unique sequence is stored once in the output file, and a size annotation is added to indicate how many times it appeared in the original dataset.
+
+### Bash code to dereplicate all samples
+
+```bash
+#!/bin/bash
+
+# Carpeta donde están los archivos no quiméricos (FASTQ)
+INPUT_DIR="/Users/marisabelcharlocabrera/Desktop/Short_Read_Feaces/NoChimera_FASTQ"
+# Carpeta donde se guardarán los resultados dereplicados
+OUTPUT_DIR="/Users/marisabelcharlocabrera/Desktop/Short_Read_Feaces/Dereplicated"
+
+for fq in "$INPUT_DIR"/*.nochim.fq
+do     
+    sample=$(basename "$fq" .nochim.fq)
+    echo "🔄 Dereplicating sample: $sample ..."          
+
+    vsearch --fastx_uniques "$fq" \
+        --fastqout "$OUTPUT_DIR/${sample}.derep.fq" \
+        --sizeout \
+        --relabel "${sample}_"
+done
+
+echo "✅ Dereplication complete for all samples."
+```
+
+```bash
+INPUT_DIR="/Users/marisabelcharlocabrera/Desktop/Short_Read_Feaces/Dereplicated"
+OUTPUT_DIR="/Users/marisabelcharlocabrera/Desktop/Short_Read_Feaces/NoChimera"
+
+for fq in "$INPUT_DIR"/*.derep.fq
+do
+    sample=$(basename "$fq" .derep.fq)
+    echo "🔄 Eliminando quimeras para $sample"
+
+    # Ejecutar uchime_denovo (recuerda que salida siempre será FASTA)
+    vsearch --uchime_denovo "$fq" \
+        --nonchimeras "$OUTPUT_DIR/${sample}.nochim.fa" \
+        --chimeras "$OUTPUT_DIR/${sample}.chimeras.fa" \
+        --uchimeout "$OUTPUT_DIR/${sample}.uchime.txt"
+done
+```
+
+INPUT_DIR="/Users/marisabelcharlocabrera/Desktop/Short_Read_Feaces/NoChimera""
+OUTPUT_DIR="/Users/marisabelcharlocabrera/Desktop/Short_Read_Feaces/Dereplicated"
+THREADS=8
+
+for fq in "$INPUT_DIR"/*.nochim.fq
+do
+    # Saltar si no hay archivos
+    [ -e "$fq" ] || continue
+
+    sample=$(basename "$fq" .nochim.fq)
+    echo "Dereplicating sample: $sample ..."
+
+    vsearch --fastx_uniques "$fq" \
+        --fastqout "$OUTPUT_DIR/${sample}.derep.fq" \
+        --sizeout \
+        --relabel "${sample}_" \
+        --threads $THREADS
+done
+
+echo "✅ Dereplication complete. Check files in $OUTPUT_DIR"
+Notes
+
+--derep_fulllength identifies sequences identical across their entire length.
+
+--sizeout appends ;size=N; to indicate the abundance of each sequence.
+
+--relabel renames sequences with a unique sample-specific prefix.
+
+The output files are stored in ../Dereplicated/ for downstream analyses like taxonomic classification (e.g., using EMU).

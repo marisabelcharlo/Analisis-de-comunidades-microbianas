@@ -1,0 +1,331 @@
+# Initial pipeline for processing long-read 16S saliva data with Oxford Nanopore
+
+This document organizes and explains a basic workflow for processing Oxford Nanopore long-read 16S amplicon data generated from saliva samples. The pipeline includes kit adapter/barcode trimming, optional 16S primer trimming, read quality control, length/quality filtering, and chimera removal.
+
+This version assumes that the FASTQ files are already available in the working directory, usually organized in barcode-specific folders such as `barcode01/`, `barcode02/`, etc.
+
+The recommended general workflow is:
+
+1. **Review whether trimming was already performed in MinKNOW** during basecalling/demultiplexing.
+2. **Trim with Dorado**, if needed, to remove Oxford Nanopore kit adapters/barcodes.
+3. **Trim 16S primers** used before library preparation.
+4. **Run quality control with NanoPlot** before and/or after filtering.
+5. **Filter reads by length and quality with NanoFilt**.
+6. **Remove chimeras with VSEARCH**.
+
+---
+
+## 1. Initial note: MinKNOW and Dorado trimming
+
+Oxford Nanopore sequencing runs are usually controlled through **MinKNOW**, the software used to start, monitor, and manage MinION/GridION/PromethION runs. Depending on the run configuration, MinKNOW can perform basecalling and demultiplexing during or after the sequencing run, and it may also apply trimming of adapters/barcodes associated with the selected Oxford Nanopore kit.
+
+In practice, this means that there are two possible situations:
+
+1. **Trimming was already enabled in MinKNOW**  
+   In this case, exported FASTQ files may already have kit adapters and/or barcodes removed. Running `dorado trim` again may be unnecessary or redundant.
+
+2. **FASTQ files were exported without trimming, or the trimming status is uncertain**  
+   In this case, `dorado trim` can be run manually on the FASTQ files to remove kit-related sequences.
+
+### What Dorado does in this context
+
+**Dorado** is Oxford Nanopore's tool for basecalling and related read-processing tasks. In this pipeline, Dorado is used specifically with the `trim` command. The purpose of `dorado trim` is to remove sequences associated with the Oxford Nanopore library preparation kit, such as adapters and barcode-related sequences.
+
+This step is different from primer trimming. Dorado targets Nanopore kit-related sequences, while tools such as `cutadapt` are used to remove the **16S PCR primers** that were added before library preparation.
+
+---
+
+## 2. Trimming with Dorado: removal of kit adapters and barcodes
+
+This step removes adapter/barcode sequences associated with the commercial Oxford Nanopore library preparation kit. In this example, the kit is `SQK-LSK114`.
+
+The idea is to concatenate all `.fastq.gz` files from a given barcode folder and pipe the reads directly into `dorado trim`.
+
+```bash
+#!/bin/bash
+set -euo pipefail
+
+DORADO="$HOME/Descargas/dorado-1.2.0-linux-x64/bin/dorado"
+KIT="SQK-LSK114"
+BARCODE="barcode01"
+OUTPUT_DIR="$BARCODE"
+OUTPUT="$OUTPUT_DIR/Trimmed_${BARCODE}_kit.fastq"
+
+echo "🚀 Processing all FASTQ.gz files in $BARCODE ..."
+
+# Concatenate FASTQ.gz files and remove kit adapters/barcodes.
+zcat "$BARCODE"/*.fastq.gz | \
+  "$DORADO" trim - \
+    --sequencing-kit "$KIT" \
+    --emit-fastq \
+    > "$OUTPUT"
+
+echo "✅ Dorado trimming finished. Output file:"
+echo "   $OUTPUT"
+```
+
+### What this step does
+
+- Takes all compressed raw reads inside one `barcodeXX` folder.
+- Decompresses them with `zcat`.
+- Sends the reads to `dorado trim`.
+- Uses the kit name specified in `KIT` to identify the expected adapter/barcode structure.
+- Generates an uncompressed FASTQ file with kit adapters/barcodes removed.
+
+### Expected input
+
+```text
+barcode01/*.fastq.gz
+```
+
+### Expected output
+
+```text
+barcode01/Trimmed_barcode01_kit.fastq
+```
+
+### Practical note
+
+Before running this step, check whether MinKNOW already performed trimming during basecalling/demultiplexing. If the reads were already trimmed in MinKNOW, this Dorado step may be skipped.
+
+This trimming step targets Nanopore kit-related sequences. It does **not necessarily remove the 16S PCR primers**. For that reason, a second primer-specific trimming step is recommended.
+
+---
+
+## 3. Trimming 16S primers with Cutadapt
+
+After removing Nanopore kit adapters/barcodes, it may still be necessary to remove the 16S primers used before library preparation. This can be done with `cutadapt`.
+
+### Create a Conda environment with Cutadapt
+
+```bash
+conda create -n cutadapt -c bioconda -c conda-forge cutadapt
+conda activate cutadapt
+```
+
+### General template for primer trimming
+
+Replace the primer sequences below with the actual primers used in the experiment.
+
+```bash
+#!/bin/bash
+set -euo pipefail
+
+INPUT_DIR="/home/mcharlo/Escritorio/Long_reads_Saliva_16S/First_run_lr_saliva"
+OUTPUT_DIR="$INPUT_DIR/Primer_trimmed"
+mkdir -p "$OUTPUT_DIR"
+
+# Replace these with the actual primers used for 16S PCR.
+FWD_PRIMER="FORWARD_PRIMER_SEQUENCE"
+REV_PRIMER="REVERSE_PRIMER_SEQUENCE"
+
+for fq in "$INPUT_DIR"/barcode*/Trimmed_*_kit.fastq; do
+  sample=$(basename "$fq" .fastq)
+  echo "🔹 Trimming primers from $sample ..."
+
+  cutadapt \
+    -g "$FWD_PRIMER" \
+    -a "$REV_PRIMER" \
+    --discard-untrimmed \
+    -o "$OUTPUT_DIR/${sample}_primertrim.fastq" \
+    "$fq"
+done
+
+echo "✅ Primer trimming finished. Files saved in: $OUTPUT_DIR"
+```
+
+### What this step does
+
+- Searches for FASTQ files previously processed with Dorado.
+- Removes 16S primers.
+- Optionally discards reads in which primers were not detected, if `--discard-untrimmed` is used.
+- Generates FASTQ files with the suffix `_primertrim.fastq`.
+
+### Important note for Nanopore reads
+
+Nanopore reads may appear in both forward and reverse orientations. If stricter primer trimming is needed, include the reverse-complement sequences of the primers as well, or use an amplicon-specific trimming strategy. The template above is a simple starting point and should be adjusted to the actual primer design.
+
+---
+
+## 4. Global quality control with NanoPlot
+
+NanoPlot is used to evaluate read length distribution, mean read quality, N50, and other sequencing metrics. This step can be applied to raw reads, Dorado-trimmed reads, primer-trimmed reads, or filtered reads.
+
+### NanoPlot for all raw reads combined
+
+```bash
+#!/bin/bash
+set -euo pipefail
+
+OUTDIR="NanoPlot_All"
+mkdir -p "$OUTDIR"
+
+# Find all FASTQ.gz files inside barcodeXX folders.
+FASTQS=$(find . -maxdepth 2 -type f -path "./barcode*/*.fastq.gz")
+
+echo "📊 Generating NanoPlot for ALL raw reads..."
+
+NanoPlot \
+  --fastq $FASTQS \
+  -o "$OUTDIR" \
+  --threads 16 \
+  --loglength \
+  --N50 \
+  --plots hex dot kde \
+  --title "NanoPlot - All Barcodes Combined"
+
+echo "✅ NanoPlot finished. Report: $OUTDIR/NanoPlot-report.html"
+```
+
+### What this allows you to inspect
+
+- Read length distribution.
+- Mean read quality.
+- N50.
+- Presence of reads that are too short or too long.
+- Whether the expected 16S amplicon size range is represented.
+
+---
+
+## 5. Length and quality filtering with NanoFilt
+
+NanoFilt can filter reads according to quality and length. For long 16S amplicons, it may be useful to retain reads within a range compatible with the expected amplicon size.
+
+Two filtering options are shown below.
+
+---
+
+### 5.1. Strict filtering: Q10 and 1300–1700 bp
+
+This filtering strategy retains reads with:
+
+- Minimum length: 1300 bp.
+- Maximum length: 1700 bp.
+- Minimum quality: Q10.
+
+```bash
+#!/bin/bash
+set -euo pipefail
+
+OUTDIR="NanoFilt_Q10_1300-1700"
+mkdir -p "$OUTDIR"
+
+for bc in barcode*; do
+  echo "📌 Filtering $bc ..."
+
+  if compgen -G "$bc/*.fastq.gz" > /dev/null; then
+    zcat "$bc"/*.fastq.gz | \
+      NanoFilt -l 1300 --maxlength 1700 -q 10 | \
+      gzip > "$OUTDIR/${bc}_1300-1700bp_Q10.fastq.gz"
+
+    echo "✅ Saved: $OUTDIR/${bc}_1300-1700bp_Q10.fastq.gz"
+  else
+    echo "⚠️ No FASTQ.gz files found inside $bc. Skipping."
+  fi
+done
+
+echo "✅ Filtering finished for all barcodes."
+```
+
+### When to use this criterion
+
+This criterion is useful if the expected amplicon is close to full-length 16S and you want to retain a relatively narrow read-length range.
+
+---
+
+## 6. NanoPlot after filtering
+
+After filtering with NanoFilt, NanoPlot should be run again to check how the length and quality distributions changed.
+
+```bash
+#!/bin/bash
+set -euo pipefail
+
+NanoPlot \
+  --fastq NanoFilt_byBarcode/*.fastq.gz \
+  -o NanoPlot_filtered_all \
+  --threads 8 \
+  --N50 \
+  --plots kde hex dot \
+  --title "NanoPlot - Filtered reads"
+
+echo "✅ NanoPlot for filtered reads finished."
+echo "📄 Report: NanoPlot_filtered_all/NanoPlot-report.html"
+
+# Optional: open the report if working in a graphical Linux environment.
+xdg-open NanoPlot_filtered_all/NanoPlot-report.html
+```
+
+### Expected result
+
+```text
+NanoPlot_filtered_all/
+├── NanoPlot-report.html
+├── *.png
+└── *.txt
+```
+
+---
+
+## 7. Chimera removal with VSEARCH
+
+Chimeras can be generated during PCR and may affect downstream taxonomic classification. They can be removed using `vsearch --uchime_denovo`.
+
+### Recommendation
+
+`vsearch --uchime_denovo` is typically run on FASTA files. Therefore, if the starting point is filtered FASTQ data, it is convenient to first convert the files to FASTA. One simple option is to use `seqkit`.
+
+### Create a Conda environment with VSEARCH and SeqKit
+
+```bash
+conda create -n vsearch_env -c bioconda -c conda-forge vsearch seqkit
+conda activate vsearch_env
+```
+
+### Script to remove chimeras from filtered FASTQ.gz files
+
+```bash
+#!/bin/bash
+set -euo pipefail
+
+INPUT_DIR="/home/mcharlo/Escritorio/Long_reads_Saliva_16S/First_run_lr_saliva/NanoFilt_byBarcode"
+OUTPUT_DIR="/home/mcharlo/Escritorio/Long_reads_Saliva_16S/First_run_lr_saliva/NoChimera_NanoFilt"
+TMP_DIR="$OUTPUT_DIR/tmp_fasta"
+
+mkdir -p "$OUTPUT_DIR" "$TMP_DIR"
+
+cd "$INPUT_DIR" || exit 1
+
+echo "🔹 Chimera removal starting ..."
+
+for fq in *.fastq.gz; do
+  sample=$(basename "$fq" .fastq.gz)
+  echo "🔄 Removing chimeras for $sample"
+
+  fasta_tmp="$TMP_DIR/${sample}.fa"
+
+  # Convert FASTQ.gz to FASTA.
+  seqkit fq2fa "$fq" > "$fasta_tmp"
+
+  # De novo chimera removal.
+  vsearch --uchime_denovo "$fasta_tmp" \
+    --nonchimeras "$OUTPUT_DIR/${sample}.nochim.fa" \
+    --chimeras "$OUTPUT_DIR/${sample}.chimeras.fa" \
+    --uchimeout "$OUTPUT_DIR/${sample}.uchime.txt"
+done
+
+echo "✅ Chimera removal complete."
+echo "📁 Non-chimeric files saved in: $OUTPUT_DIR"
+```
+
+### Output files
+
+For each sample/barcode, the script generates:
+
+```text
+sample.nochim.fa       # non-chimeric reads
+sample.chimeras.fa     # reads identified as chimeric
+sample.uchime.txt      # UCHIME result table/summary
+```
+
+## 11. Taxonomic classification can be done using EMU

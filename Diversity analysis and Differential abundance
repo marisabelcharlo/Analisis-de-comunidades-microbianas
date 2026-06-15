@@ -1,0 +1,727 @@
+# Microbiome diversity and differential abundance analyses with `breakaway`, `DivNet`, and `radEmu`
+
+This document summarizes how to use three R packages commonly applied after taxonomic profiling of microbiome sequencing data:
+
+- `breakaway` for richness estimation.
+- `DivNet` for Shannon, Simpson, Bray-Curtis and related diversity estimates.
+- `radEmu` for differential abundance analysis.
+
+The examples assume that the sequencing data have already been processed, classified and integrated into R as a `phyloseq` object. This document does **not** include read filtering, taxonomic filtering, chimera removal, EMU classification or database-building steps.
+
+The same general approach can be applied to short-read or long-read 16S data once the output has been converted into a sample-by-taxon count or estimated-count matrix with corresponding sample metadata.
+
+---
+
+## 1. General starting point
+
+The examples below assume that a `phyloseq` object called `ps` is already available.
+
+The object should contain:
+
+1. An taxon table with counts or estimated counts.
+2. A taxonomy table.
+3. A sample metadata table.
+
+For paired designs, the metadata should include a subject-level identifier. For example:
+
+| Variable | Meaning | Example |
+|---|---|---|
+| `SampleID` | Participant or subject identifier | `P001`, `P002` |
+| `Timepoint` | Within-subject condition | `Pre`, `Post` |
+| `Group` | Between-subject group | `Control`, `Periodontitis` |
+| `Age`, `Sex`, etc. | Optional covariates | numeric / categorical |
+
+Example setup:
+
+```r
+library(phyloseq)
+library(tidyverse)
+
+meta <- data.frame(sample_data(ps))
+
+meta <- meta %>%
+  mutate(
+    Timepoint = factor(Timepoint, levels = c("Pre", "Post")),
+    Group = factor(Group),
+    SampleID = factor(SampleID)
+  )
+```
+
+For paired pre/post analyses, the recommended structure is:
+
+```text
+SampleID     Timepoint
+P001         Pre
+P001         Post
+P002         Pre
+P002         Post
+```
+
+For unpaired analyses, each sample can be treated as independent:
+
+```text
+SampleID     Group
+P001         Control
+P002         Control
+P003         Periodontitis
+P004         Periodontitis
+```
+
+---
+
+## 2. Conceptual overview
+
+| Package | Main use | Typical output | Paired design support | Main strength | Main limitation |
+|---|---|---|---|---|---|
+| `breakaway` | Richness estimation | Estimated richness and standard error per sample | Indirect: estimate richness first, then model it with paired/mixed models | Estimates unobserved richness and uncertainty | Sensitive to rare taxa and singleton structure |
+| `DivNet` | Shannon, Simpson, Bray-Curtis, Euclidean diversity | Alpha and beta diversity estimates | Indirect: estimate diversity first, then use paired/mixed models or restricted permutations | Accounts for taxon co-occurrence/network structure | Can be slow with many taxa |
+| `radEmu` | Differential abundance | Taxon-level log fold-differences / multiplicative abundance shifts | Directly supports clustered/repeated data through `cluster` | No pseudocounts, no denominator/reference taxon, handles zeros | Interpretation is relative to typical fold-differences across taxa |
+
+---
+
+## 3. `breakaway`: richness estimation
+
+### 3.1. What it estimates
+
+`breakaway` estimates species/taxon richness, including the number of taxa that may be present but unobserved due to incomplete sampling.
+
+This differs from simple observed richness:
+
+```text
+Observed richness = number of taxa detected in a sample.
+Estimated richness = observed taxa + estimated undetected taxa.
+```
+
+This is useful for microbiome data because rare taxa and incomplete sampling can bias richness comparisons.
+
+### 3.2. Installation
+
+```r
+install.packages("breakaway")
+```
+
+or, for the development version:
+
+```r
+install.packages("remotes")
+remotes::install_github("adw96/breakaway")
+```
+
+### 3.3. Estimate richness from a `phyloseq` object
+
+```r
+library(breakaway)
+library(tidyverse)
+
+richness_est <- physeq_wrap(breakaway, ps)
+
+richness_df <- summary(richness_est) %>%
+  as_tibble() %>%
+  mutate(Sample = sample_names(ps)) %>%
+  left_join(
+    meta %>% rownames_to_column("Sample"),
+    by = "Sample"
+  )
+
+head(richness_df)
+```
+
+Depending on the package version, column names may include fields such as:
+
+```text
+estimate
+error
+name
+```
+
+A practical check is:
+
+```r
+names(richness_df)
+```
+
+Then rename the columns used in downstream models:
+
+```r
+richness_df <- richness_df %>%
+  rename(
+    Richness = estimate,
+    SE = error
+  )
+```
+
+### 3.4. Paired richness comparison
+
+For a pre/post design, the key point is to account for the non-independence of samples from the same participant.
+
+```r
+library(lme4)
+library(lmerTest)
+
+fit_richness_paired <- lmer(
+  Richness ~ Timepoint + (1 | SampleID),
+  data = richness_df
+)
+
+summary(fit_richness_paired)
+```
+
+Interpretation:
+
+```text
+The Timepoint coefficient estimates the average within-subject change in estimated richness from Pre to Post.
+```
+
+### 3.5. Unpaired richness comparison
+
+For independent groups:
+
+```r
+fit_richness_unpaired <- lm(
+  Richness ~ Group,
+  data = richness_df
+)
+
+summary(fit_richness_unpaired)
+```
+
+With covariates:
+
+```r
+fit_richness_unpaired_adj <- lm(
+  Richness ~ Group + Age + Sex,
+  data = richness_df
+)
+
+summary(fit_richness_unpaired_adj)
+```
+
+### 3.6. Strengths and weaknesses of `breakaway`
+
+**Strengths**
+
+- Specifically designed for microbial richness estimation.
+- Estimates uncertainty around richness estimates.
+- Attempts to account for unobserved taxa.
+- More informative than simple observed richness when sampling is incomplete.
+
+**Weaknesses**
+
+- Strongly affected by the rare-taxon structure of the data.
+- Sensitive to singleton/doubleton behavior, sequencing errors and aggressive denoising/filtering.
+- Does not directly model paired designs; the estimated richness values need to be analyzed downstream.
+- Richness is only one aspect of alpha diversity and does not reflect evenness.
+
+---
+
+## 4. `DivNet`: Shannon, Simpson and beta diversity estimation
+
+### 4.1. What it estimates
+
+`DivNet` estimates diversity indices while accounting for the fact that microbial taxa are not statistically independent. Taxa may co-occur or exclude each other due to ecological relationships, shared niches or biological interactions.
+
+Common outputs include:
+
+- Shannon diversity.
+- Simpson diversity.
+- Bray-Curtis dissimilarity.
+- Euclidean distance.
+
+This is useful when the goal is not only to calculate plug-in diversity indices, but to estimate diversity while accounting for sampling uncertainty and taxon co-occurrence structure.
+
+### 4.2. Installation
+
+```r
+install.packages("remotes")
+remotes::install_github("adw96/breakaway")
+remotes::install_github("adw96/DivNet")
+```
+
+```r
+library(DivNet)
+```
+
+### 4.3. Estimate diversity with no covariate
+
+This estimates diversity indices per sample without testing a specific covariate inside `DivNet`.
+
+```r
+library(DivNet)
+
+set.seed(123)
+
+div_fit <- divnet(
+  ps,
+  X = NULL,
+  ncores = 4
+)
+
+names(div_fit)
+```
+
+Expected elements commonly include:
+
+```text
+shannon
+simpson
+bray-curtis
+euclidean
+shannon-variance
+simpson-variance
+bray-curtis-variance
+euclidean-variance
+fitted_z
+```
+
+Inspect the structure before extraction:
+
+```r
+str(div_fit$shannon)
+str(div_fit$simpson)
+```
+
+### 4.4. Extract alpha diversity estimates
+
+The exact extraction may vary slightly by package version, so inspect the object first.
+
+A common workflow is:
+
+```r
+shannon_vec <- div_fit$shannon
+simpson_vec <- div_fit$simpson
+
+alpha_divnet <- tibble(
+  Sample = sample_names(ps),
+  Shannon = as.numeric(shannon_vec),
+  Simpson = as.numeric(simpson_vec)
+) %>%
+  left_join(
+    meta %>% rownames_to_column("Sample"),
+    by = "Sample"
+  )
+
+head(alpha_divnet)
+```
+
+If the output is not a simple named vector, use:
+
+```r
+str(div_fit$shannon)
+```
+
+and adapt the extraction accordingly.
+
+### 4.5. Paired alpha-diversity comparison
+
+```r
+library(lme4)
+library(lmerTest)
+
+fit_shannon_paired <- lmer(
+  Shannon ~ Timepoint + (1 | SampleID),
+  data = alpha_divnet
+)
+
+summary(fit_shannon_paired)
+```
+
+For Simpson diversity:
+
+```r
+fit_simpson_paired <- lmer(
+  Simpson ~ Timepoint + (1 | SampleID),
+  data = alpha_divnet
+)
+
+summary(fit_simpson_paired)
+```
+
+### 4.6. Unpaired alpha-diversity comparison
+
+```r
+fit_shannon_unpaired <- lm(
+  Shannon ~ Group,
+  data = alpha_divnet
+)
+
+summary(fit_shannon_unpaired)
+```
+
+With covariates:
+
+```r
+fit_shannon_unpaired_adj <- lm(
+  Shannon ~ Group + Age + Sex,
+  data = alpha_divnet
+)
+
+summary(fit_shannon_unpaired_adj)
+```
+
+### 4.7. Estimating diversity with a covariate inside `DivNet`
+
+For independent groups, `DivNet` can estimate diversity with a covariate and test diversity differences.
+
+```r
+div_group <- divnet(
+  ps,
+  X = "Group",
+  ncores = 4
+)
+
+testDiversity(div_group)
+```
+
+For paired or repeated-measures designs, it is usually safer to extract the diversity estimates and use a model that explicitly accounts for `SampleID`, or to use restricted permutations for beta diversity.
+
+### 4.8. Beta diversity with Bray-Curtis from `DivNet`
+
+If Bray-Curtis estimates are available from the `DivNet` object:
+
+```r
+bray_divnet <- as.dist(div_fit$`bray-curtis`)
+```
+
+For unpaired PERMANOVA:
+
+```r
+library(vegan)
+
+adonis2(
+  bray_divnet ~ Group,
+  data = meta,
+  permutations = 999
+)
+```
+
+For paired pre/post PERMANOVA, restrict permutations within subject:
+
+```r
+adonis2(
+  bray_divnet ~ Timepoint,
+  data = meta,
+  permutations = 999,
+  strata = meta$SampleID
+)
+```
+
+Interpretation:
+
+```text
+The restricted PERMANOVA tests whether community composition differs between timepoints while respecting the paired structure of the design.
+```
+
+### 4.9. Strengths and weaknesses of `DivNet`
+
+**Strengths**
+
+- Estimates Shannon and Simpson diversity with uncertainty.
+- Can estimate beta-diversity indices such as Bray-Curtis and Euclidean distances.
+- Accounts for ecological dependence among taxa rather than assuming independent taxa.
+- Useful when diversity estimates are intended to be interpreted statistically rather than only descriptively.
+
+**Weaknesses**
+
+- Computationally demanding, especially with many taxa.
+- May require taxonomic aggregation before analysis, for example species-level for oral samples or genus-level for gut samples.
+- Paired designs are not as direct as in a mixed model; paired structure should be handled in downstream models or through restricted permutations.
+- Output extraction can require checking object structure depending on the installed version.
+
+---
+
+## 5. `radEmu`: differential abundance analysis
+
+### 5.1. What it estimates
+
+`radEmu` is used for differential abundance analysis of microbiome data. It estimates taxon-specific fold-differences in abundance across sample-level covariates.
+
+Important points:
+
+- It can be used with amplicon or shotgun sequencing data.
+- It does not require rarefaction.
+- It does not require pseudocounts.
+- It does not require choosing a denominator/reference taxon.
+- It can account for clustered or repeated-measures data using the `cluster` argument.
+- It can use `phyloseq` objects directly.
+
+The output is interpreted as taxon-level multiplicative changes relative to the typical fold-difference across taxa. Therefore, it does not estimate absolute abundance per sample, but it can estimate fold-differences in abundance across conditions.
+
+### 5.2. Installation
+
+```r
+install.packages("radEmu")
+```
+
+or, for the development version:
+
+```r
+install.packages("remotes")
+remotes::install_github("statdivlab/radEmu")
+```
+
+```r
+library(radEmu)
+```
+
+### 5.3. Basic unpaired differential abundance model
+
+For independent groups:
+
+```r
+library(radEmu)
+
+sample_data(ps)$Group <- factor(sample_data(ps)$Group)
+
+fit_group <- emuFit(
+  formula = ~ Group,
+  Y = ps,
+  run_score_tests = TRUE
+)
+
+head(fit_group$coef)
+```
+
+With covariates:
+
+```r
+fit_group_adj <- emuFit(
+  formula = ~ Group + Age + Sex,
+  Y = ps,
+  run_score_tests = TRUE
+)
+
+head(fit_group_adj$coef)
+```
+
+The result table generally includes:
+
+```text
+covariate
+category / taxon
+estimate
+standard error
+confidence interval
+p-value
+```
+
+To visualize:
+
+```r
+plot(fit_group)$plots
+```
+
+### 5.4. Paired pre/post differential abundance model
+
+For repeated measurements from the same subject, use the `cluster` argument.
+
+```r
+meta <- data.frame(sample_data(ps))
+
+sample_data(ps)$Timepoint <- factor(
+  sample_data(ps)$Timepoint,
+  levels = c("Pre", "Post")
+)
+
+fit_paired <- emuFit(
+  formula = ~ Timepoint,
+  Y = ps,
+  cluster = meta$SampleID,
+  run_score_tests = TRUE
+)
+
+head(fit_paired$coef)
+```
+
+Interpretation:
+
+```text
+The TimepointPost coefficient represents the taxon-specific shift from Pre to Post, accounting for repeated measurements within the same participant through the clustering variable.
+```
+
+With covariates:
+
+```r
+fit_paired_adj <- emuFit(
+  formula = ~ Timepoint + Age + Sex,
+  Y = ps,
+  cluster = meta$SampleID,
+  run_score_tests = TRUE
+)
+
+head(fit_paired_adj$coef)
+```
+
+### 5.5. Using a sample-by-taxon matrix instead of `phyloseq`
+
+`radEmu` can also be used with a matrix or data frame where rows are samples and columns are taxa.
+
+```r
+Y <- as(otu_table(ps), "matrix")
+
+if (taxa_are_rows(ps)) {
+  Y <- t(Y)
+}
+
+meta <- data.frame(sample_data(ps))
+
+fit_matrix <- emuFit(
+  formula = ~ Timepoint,
+  data = meta,
+  Y = Y,
+  cluster = meta$SampleID,
+  run_score_tests = TRUE
+)
+```
+
+This format is useful when working directly from EMU output tables or custom count matrices.
+
+### 5.6. Strengths and weaknesses of `radEmu`
+
+**Strengths**
+
+- Designed for differential abundance analysis of microbiome data.
+- Can be used with amplicon or shotgun data.
+- Works with `phyloseq` objects and count/abundance matrices.
+- Does not require rarefaction.
+- Handles zeros without pseudocounts.
+- Does not require a fixed reference taxon or denominator taxon.
+- Can adjust for covariates.
+- Can account for paired/repeated designs using `cluster`.
+
+**Weaknesses**
+
+- Interpretation is less intuitive than simple relative-abundance comparisons.
+- Estimates are relative to typical abundance shifts across taxa, not direct absolute abundance per sample.
+- Joint modeling of all taxa can be computationally intensive.
+- Very high-dimensional datasets may need prior aggregation or careful computational planning.
+- As with any differential abundance method, results depend on the chosen taxonomic level, sample size and study design.
+
+---
+
+## 6. Recommended use by study design
+
+### 6.1. Paired pre/post design
+
+Example: samples before and after non-surgical periodontal treatment from the same participant.
+
+| Question | Recommended method | Model structure |
+|---|---|---|
+| Does richness change from Pre to Post? | `breakaway` + mixed model | `Richness ~ Timepoint + (1 | SampleID)` |
+| Does Shannon/Simpson diversity change from Pre to Post? | `DivNet` + mixed model | `Shannon ~ Timepoint + (1 | SampleID)` |
+| Does overall composition change from Pre to Post? | Bray-Curtis + PERMANOVA | `adonis2(... ~ Timepoint, strata = SampleID)` |
+| Which taxa change from Pre to Post? | `radEmu` | `emuFit(~ Timepoint, cluster = SampleID)` |
+
+### 6.2. Unpaired group comparison
+
+Example: baseline comparison between periodontal-stage groups or independent clinical groups.
+
+| Question | Recommended method | Model structure |
+|---|---|---|
+| Does richness differ between groups? | `breakaway` + linear model | `Richness ~ Group` |
+| Does Shannon/Simpson diversity differ between groups? | `DivNet` or extracted estimates + linear model | `Shannon ~ Group` |
+| Does overall composition differ between groups? | Bray-Curtis + PERMANOVA | `adonis2(... ~ Group)` |
+| Which taxa differ between groups? | `radEmu` | `emuFit(~ Group)` |
+
+### 6.3. Adjusted analyses
+
+When relevant, include covariates such as age, sex, diabetes status, smoking, BMI, sequencing batch or clinical variables.
+
+Examples:
+
+```r
+Richness ~ Timepoint + Age + Sex + (1 | SampleID)
+```
+
+```r
+Shannon ~ Group + Age + Sex
+```
+
+```r
+emuFit(
+  formula = ~ Timepoint + Age + Sex,
+  Y = ps,
+  cluster = meta$SampleID
+)
+```
+
+---
+
+## 7. Notes for EMU-derived data
+
+When EMU output is used as input:
+
+- `estimated.counts` can be used to build an estimated-count matrix.
+- For `phyloseq`, counts are usually arranged as taxa in rows and samples in columns.
+- For `radEmu` matrix input, rows should be samples and columns should be taxa.
+- Use the same taxonomic level across all samples before analysis.
+- Do not mix species-level and genus-level profiles in the same model.
+
+A common strategy is:
+
+```text
+Oral/saliva long-read 16S  → species-level analysis when reliable.
+Gut/fecal 16S              → genus-level analysis when species-level assignment is less stable.
+```
+
+For diversity estimation with `breakaway` and `DivNet`, use count-like data rather than relative-abundance-only tables. For `radEmu`, non-integer abundance matrices can be used, but the input should still represent sample-by-taxon abundance information.
+
+---
+
+## 8. Practical interpretation guide
+
+### 8.1. Richness
+
+```text
+Higher richness means more taxa are estimated to be present.
+```
+
+Richness does not tell whether taxa are evenly distributed. A sample can have high richness but still be dominated by a few taxa.
+
+### 8.2. Shannon diversity
+
+```text
+Higher Shannon diversity generally indicates both more taxa and greater evenness.
+```
+
+Shannon diversity is sensitive to both richness and relative abundance distribution.
+
+### 8.3. Simpson diversity
+
+```text
+Simpson diversity is more strongly influenced by dominant taxa.
+```
+
+It is useful when the dominant structure of the community is biologically relevant.
+
+### 8.4. Bray-Curtis dissimilarity
+
+```text
+Higher Bray-Curtis dissimilarity means two samples have more different community compositions.
+```
+
+It is commonly used for beta-diversity analysis and ordination.
+
+### 8.5. Differential abundance with `radEmu`
+
+```text
+A positive coefficient suggests that a taxon increased in the tested condition relative to the typical taxon-level shift.
+A negative coefficient suggests that a taxon decreased in the tested condition relative to the typical taxon-level shift.
+```
+
+When useful, convert log-scale estimates to multiplicative fold-differences:
+
+```r
+rad_results <- fit_paired$coef %>%
+  mutate(fold_difference = exp(estimate))
+```
+
+--
+
+## 9. References and documentation
+
+- `breakaway`: https://adw96.github.io/breakaway/
+- `DivNet`: https://github.com/adw96/DivNet
+- `radEmu`: https://github.com/statdivlab/radEmu
+- `radEmu` CRAN page: https://cran.r-project.org/package=radEmu
+- `phyloseq`: https://bioconductor.org/packages/release/bioc/html/phyloseq.html
+- `vegan`: https://cran.r-project.org/package=vegan

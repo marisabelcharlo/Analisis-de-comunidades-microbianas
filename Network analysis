@@ -1,0 +1,571 @@
+# Microbiome network analysis with `NetCoMi`, `SPIEC-EASI`, and `igraph`
+
+This document summarizes a general workflow for microbial association network analysis after taxonomic profiling of microbiome sequencing data.
+
+The examples assume that reads have already been processed, classified, and integrated into R as a `phyloseq` object. This document does **not** include scripts for read filtering, taxonomic filtering, chimera removal, EMU classification, database construction, or sample exclusion.
+
+The same general framework can be used with short-read or long-read 16S data, as long as the final input is a taxon-by-sample abundance table with corresponding sample metadata.
+
+---
+
+## 1. Scope of this document
+
+This document focuses on how to:
+
+1. Prepare an already processed `phyloseq` object for network analysis.
+2. Construct microbial association networks.
+3. Compare networks between groups or timepoints.
+4. Extract network properties and centrality metrics.
+5. Identify hub taxa or highly connected taxa.
+6. Export edge and node tables for visualization or downstream interpretation.
+7. Interpret strengths and limitations of microbiome network analysis.
+
+The document is intended as a methodological template, not as a fully automated pipeline.
+
+---
+
+## 2. Conceptual overview
+
+Microbiome network analysis aims to infer patterns of association among taxa across samples. In a network:
+
+| Network element | Meaning |
+|---|---|
+| Node | Taxon, ASV, OTU, species, genus, or other feature |
+| Edge | Statistical association between two nodes |
+| Positive edge | Taxa tend to increase or decrease together across samples |
+| Negative edge | One taxon tends to increase when the other decreases |
+| Degree | Number of edges connected to a node |
+| Hub taxon | Highly connected taxon, depending on the selected centrality definition |
+| Module / cluster | Group of nodes more densely connected to each other than to the rest of the network |
+
+A network edge should be interpreted as an **association**, not as proof of direct ecological interaction. Edges may reflect shared niche preference, host factors, sequencing artifacts, compositional effects, or indirect relationships.
+
+---
+
+## 3. Recommended tools
+
+| Tool | Main use | Strength | Main limitation |
+|---|---|---|---|
+| `NetCoMi` | Network construction, visualization, and comparison for microbiome data | Designed specifically for microbial compositional data; supports multiple association methods and network comparison | Requires careful parameter choices; some methods can be computationally intensive |
+| `SPIEC-EASI` / `SpiecEasi` | Sparse inverse covariance network inference | Compositionally aware; estimates sparse conditional dependence networks | Requires enough samples relative to taxa; sensitive to filtering and sparsity |
+| `igraph` | General graph analysis | Flexible extraction of centrality, modules, graph metrics, and export tables | Does not solve microbiome compositionality by itself |
+| `tidyverse` | Data wrangling | Useful for preparing node and edge tables | Not a network inference method |
+| `phyloseq` | Microbiome data container | Integrates counts, taxonomy, and metadata | Network inference usually requires conversion to matrices/data frames |
+
+---
+
+## 4. General starting point
+
+The examples assume that a `phyloseq` object called `ps` is already available.
+
+The object should include:
+
+1. A taxon table with counts or estimated counts.
+2. A taxonomy table.
+3. A sample metadata table.
+
+For paired designs, the metadata should include a subject-level identifier.
+
+Example metadata structure:
+
+```text
+SampleID     Timepoint     Group
+P001         Pre           Periodontitis
+P001         Post          Periodontitis
+P002         Pre           Periodontitis
+P002         Post          Periodontitis
+```
+
+For unpaired designs:
+
+```text
+SampleID     Group
+P001         Control
+P002         Control
+P003         Periodontitis
+P004         Periodontitis
+```
+
+Basic setup:
+
+```r
+library(phyloseq)
+library(tidyverse)
+
+meta <- data.frame(sample_data(ps)) %>%
+  rownames_to_column("Sample") %>%
+  mutate(
+    SampleID = factor(SampleID),
+    Timepoint = factor(Timepoint, levels = c("Pre", "Post")),
+    Group = factor(Group)
+  )
+```
+
+---
+
+## 5. Important assumptions before network analysis
+
+Before constructing networks, the following decisions should already be documented elsewhere:
+
+1. Sequencing platform and marker region.
+2. Taxonomic classifier and reference database.
+3. Taxonomic rank used for network analysis.
+4. Whether counts, estimated counts, or relative abundances are used.
+5. Prevalence and abundance filtering criteria.
+6. Zero handling or transformation method.
+7. Whether networks are inferred separately by group, timepoint, or sample type.
+
+This document intentionally does not include filtering scripts. However, the filtering strategy should be reported because networks are highly sensitive to rare taxa and sparse count matrices.
+
+---
+
+## 6. Single network construction with `NetCoMi`
+
+`NetCoMi` can construct microbial networks from count matrices and includes several association measures, zero handling procedures, normalization options, sparsification strategies, and network comparison functions.
+
+### 6.1. Installation
+
+```r
+install.packages("devtools")
+install.packages("BiocManager")
+
+# Recommended dependencies for common network methods
+devtools::install_github("zdk123/SpiecEasi")
+devtools::install_github("GraceYoon/SPRING")
+
+# Install NetCoMi
+devtools::install_github(
+  "stefpeschel/NetCoMi",
+  repos = c("https://cloud.r-project.org/", BiocManager::repositories())
+)
+```
+
+Alternatively:
+
+```bash
+conda create -n NetCoMi
+conda activate NetCoMi
+conda install -c bioconda -c conda-forge r-netcomi
+```
+
+### 6.2. Basic single-network example
+
+```r
+library(NetCoMi)
+library(phyloseq)
+library(tidyverse)
+
+# Example: use an already processed phyloseq object
+ps_net <- ps
+
+net_single <- netConstruct(
+  data = ps_net,
+  dataType = "counts",
+  taxRank = "Genus",
+  measure = "spieceasi",
+  normMethod = "none",
+  zeroMethod = "none",
+  sparsMethod = "none",
+  verbose = 3
+)
+
+net_single_analyzed <- netAnalyze(
+  net_single,
+  centrLCC = TRUE,
+  clustMethod = "cluster_fast_greedy",
+  hubPar = "eigenvector"
+)
+
+summary(net_single_analyzed)
+plot(net_single_analyzed)
+```
+
+### 6.3. Interpretation
+
+The resulting network summarizes taxa that show statistical association patterns across samples. When using SPIEC-EASI through `NetCoMi`, the inferred edges represent sparse conditional associations rather than simple pairwise correlations.
+
+---
+
+## 7. Group-specific networks in unpaired designs
+
+For independent groups, such as healthy vs periodontitis or low vs high exposure, networks can be inferred separately for each group.
+
+```r
+ps_group_A <- subset_samples(ps, Group == "Control")
+ps_group_B <- subset_samples(ps, Group == "Periodontitis")
+
+net_group_A <- netConstruct(
+  data = ps_group_A,
+  dataType = "counts",
+  taxRank = "Genus",
+  measure = "spieceasi",
+  normMethod = "none",
+  zeroMethod = "none",
+  sparsMethod = "none",
+  verbose = 3
+)
+
+net_group_B <- netConstruct(
+  data = ps_group_B,
+  dataType = "counts",
+  taxRank = "Genus",
+  measure = "spieceasi",
+  normMethod = "none",
+  zeroMethod = "none",
+  sparsMethod = "none",
+  verbose = 3
+)
+
+net_group_A_analyzed <- netAnalyze(net_group_A, hubPar = "eigenvector")
+net_group_B_analyzed <- netAnalyze(net_group_B, hubPar = "eigenvector")
+
+plot(net_group_A_analyzed)
+plot(net_group_B_analyzed)
+```
+
+### Suggested interpretation
+
+```text
+Separate microbial association networks were inferred for each independent group. Network topology, edge density, modularity, and centrality patterns were compared descriptively between groups.
+```
+
+If formal network comparison is performed, the method and permutation strategy should be reported explicitly.
+
+---
+
+## 8. Network comparison with `NetCoMi`
+
+`NetCoMi` supports the construction and comparison of two microbial association networks.
+
+```r
+net_comp <- netCompare(
+  net_group_A_analyzed,
+  net_group_B_analyzed,
+  permTest = TRUE,
+  nPerm = 1000,
+  cores = 4
+)
+
+summary(net_comp)
+plot(net_comp)
+```
+
+Important: permutation-based network comparison should be interpreted in relation to the study design. For independent groups, unrestricted label permutations are usually more straightforward. For paired or repeated-measures designs, the permutation strategy should preserve the subject-level pairing structure whenever possible.
+
+---
+
+## 9. Pre/post paired designs
+
+In paired microbiome studies, such as pre/post periodontal treatment, the same participants contribute samples at two timepoints. This structure matters.
+
+A common descriptive approach is:
+
+1. Keep only participants with complete pre/post pairs.
+2. Infer one network for the `Pre` samples.
+3. Infer one network for the `Post` samples.
+4. Compare topology descriptively.
+5. Use paired statistical models for taxon-level abundance changes separately.
+
+Example:
+
+```r
+ps_pre <- subset_samples(ps, Timepoint == "Pre")
+ps_post <- subset_samples(ps, Timepoint == "Post")
+
+net_pre <- netConstruct(
+  data = ps_pre,
+  dataType = "counts",
+  taxRank = "Genus",
+  measure = "spieceasi",
+  normMethod = "none",
+  zeroMethod = "none",
+  sparsMethod = "none",
+  verbose = 3
+)
+
+net_post <- netConstruct(
+  data = ps_post,
+  dataType = "counts",
+  taxRank = "Genus",
+  measure = "spieceasi",
+  normMethod = "none",
+  zeroMethod = "none",
+  sparsMethod = "none",
+  verbose = 3
+)
+
+net_pre_analyzed <- netAnalyze(net_pre, hubPar = "eigenvector")
+net_post_analyzed <- netAnalyze(net_post, hubPar = "eigenvector")
+
+plot(net_pre_analyzed)
+plot(net_post_analyzed)
+```
+
+### Important caution for paired designs
+
+Most network inference methods estimate associations across samples within a condition. They do not automatically model the paired subject structure unless the method or permutation design explicitly supports it.
+
+Therefore, for paired pre/post studies, network results should often be reported as **exploratory or descriptive**, unless a paired-aware testing strategy is implemented.
+
+Suggested wording:
+
+```text
+For the paired pre/post analysis, microbial association networks were inferred separately at each timepoint using the same taxonomic rank and inference parameters. Network-level differences were interpreted descriptively because standard network inference does not directly model within-subject pairing.
+```
+
+---
+
+## 10. Direct `SPIEC-EASI` example
+
+`SPIEC-EASI` is designed for sparse and compositionally robust inference of microbial ecological association networks. It combines compositional data transformations with sparse graphical model estimation.
+
+```r
+library(SpiecEasi)
+library(phyloseq)
+library(igraph)
+
+# Example using a phyloseq object
+se_fit <- spiec.easi(
+  ps,
+  method = "mb",
+  lambda.min.ratio = 1e-2,
+  nlambda = 20,
+  pulsar.params = list(rep.num = 50)
+)
+
+# Extract adjacency matrix
+adj <- getRefit(se_fit)
+
+# Convert to igraph object
+g <- adj2igraph(adj)
+
+plot(g)
+```
+
+### Method options
+
+```text
+method = "mb"       Meinshausen-Bühlmann neighborhood selection
+method = "glasso"   graphical lasso inverse covariance estimation
+```
+
+The selected method, lambda path, and stability-selection parameters should be reported.
+
+---
+
+## 11. Extracting graph metrics with `igraph`
+
+Once a network is represented as an `igraph` object, general graph metrics can be extracted.
+
+```r
+library(igraph)
+
+node_metrics <- tibble(
+  taxon = V(g)$name,
+  degree = degree(g),
+  betweenness = betweenness(g),
+  closeness = closeness(g),
+  eigenvector = eigen_centrality(g)$vector,
+  component = components(g)$membership
+)
+
+head(node_metrics)
+```
+
+Global network metrics:
+
+```r
+network_metrics <- tibble(
+  nodes = vcount(g),
+  edges = ecount(g),
+  density = edge_density(g),
+  transitivity = transitivity(g, type = "global"),
+  average_degree = mean(degree(g)),
+  components = components(g)$no
+)
+
+network_metrics
+```
+
+---
+
+## 12. Hub taxa identification
+
+Hub taxa can be defined in several ways. A transparent approach is to define hubs based on one or more centrality metrics.
+
+Example using degree:
+
+```r
+hub_taxa_degree <- node_metrics %>%
+  arrange(desc(degree)) %>%
+  slice_head(n = 10)
+
+hub_taxa_degree
+```
+
+Example using combined rank:
+
+```r
+hub_taxa_combined <- node_metrics %>%
+  mutate(
+    rank_degree = rank(-degree, ties.method = "average"),
+    rank_eigenvector = rank(-eigenvector, ties.method = "average"),
+    rank_betweenness = rank(-betweenness, ties.method = "average"),
+    mean_rank = rowMeans(across(starts_with("rank_")), na.rm = TRUE)
+  ) %>%
+  arrange(mean_rank) %>%
+  slice_head(n = 10)
+
+hub_taxa_combined
+```
+
+Suggested wording:
+
+```text
+Hub taxa were defined as taxa ranking among the most central nodes according to degree and eigenvector centrality. These taxa were interpreted as highly connected members of the inferred association network, not necessarily as causal keystone taxa.
+```
+
+---
+
+## 13. Exporting node and edge tables
+
+Exporting networks as node and edge tables is useful for Cytoscape, Gephi, manual annotation, or reproducibility.
+
+```r
+edge_table <- as_data_frame(g, what = "edges")
+node_table <- as_data_frame(g, what = "vertices")
+
+write_csv(edge_table, "network_edges.csv")
+write_csv(node_metrics, "network_nodes_with_metrics.csv")
+```
+
+If taxonomy is available, merge node metrics with taxonomy:
+
+```r
+tax_df <- as.data.frame(tax_table(ps)) %>%
+  rownames_to_column("taxon")
+
+node_metrics_tax <- node_metrics %>%
+  left_join(tax_df, by = "taxon")
+
+write_csv(node_metrics_tax, "network_nodes_with_taxonomy.csv")
+```
+
+---
+
+## 14. Positive and negative associations
+
+Some methods return signed associations. Positive and negative edges should be interpreted carefully.
+
+| Edge sign | Possible interpretation | Caution |
+|---|---|---|
+| Positive | Shared niche, co-occurrence, similar response to host/environment | May reflect confounding or compositional effects |
+| Negative | Exclusion pattern, contrasting niche, inverse response | Does not prove competition |
+
+Suggested wording:
+
+```text
+Positive and negative edges were interpreted as statistical association patterns. They were not interpreted as direct cooperation or competition without additional biological evidence.
+```
+
+---
+
+## 15. Recommended reporting checklist
+
+When reporting microbiome network analysis, include:
+
+1. Input data type: counts, estimated counts, relative abundances, or transformed abundances.
+2. Taxonomic level: ASV, OTU, species, genus, family, etc.
+3. Number of samples used for each network.
+4. Number of taxa included after filtering.
+5. Filtering criteria, reported elsewhere if not shown in the analysis script.
+6. Network inference method.
+7. Zero handling method.
+8. Normalization or transformation method.
+9. Sparsification or thresholding method.
+10. Whether edges are signed or unsigned.
+11. Number of nodes and edges.
+12. Global network metrics.
+13. Centrality metrics used to define hubs.
+14. Whether formal network comparison was performed.
+15. Whether the study design was paired or unpaired.
+
+---
+
+## 16. Strengths and weaknesses of network analysis
+
+### Strengths
+
+- Provides a systems-level summary of taxon-taxon association structure.
+- Can identify highly connected taxa or modules for further study.
+- Can compare ecological organization between groups or timepoints.
+- Useful for hypothesis generation in oral-gut axis, dysbiosis, treatment-response, and ecological transition studies.
+- Can complement alpha diversity, beta diversity, and differential abundance analyses.
+
+### Weaknesses
+
+- Edges are statistical associations, not validated biological interactions.
+- Results are sensitive to sample size, sequencing depth, filtering, and taxonomic rank.
+- Microbiome data are compositional, sparse, and zero-inflated.
+- Rare taxa can introduce unstable edges.
+- Different inference methods can produce different networks.
+- Paired designs require special care because many network methods do not directly model within-subject dependence.
+- Hub taxa should not automatically be described as keystone species.
+
+---
+
+## 17. Practical interpretation guide
+
+| Result | Conservative interpretation |
+|---|---|
+| More edges after treatment | Higher inferred connectivity, not necessarily stronger biological interaction |
+| Fewer edges after treatment | Lower inferred connectivity or reduced detectable association structure |
+| Different hub taxa | Different central taxa in the inferred network under the selected method |
+| Module rearrangement | Change in association structure among groups of taxa |
+| Negative edge | Inverse statistical association, not direct competition |
+| Positive edge | Co-abundance pattern, not direct cooperation |
+
+---
+
+## 18. Example text for methods section
+
+```text
+Microbial association networks were inferred from the processed taxon abundance table using compositionally aware network methods. Networks were constructed at the selected taxonomic rank using identical parameters across groups or timepoints. Network topology was summarized using the number of nodes and edges, edge density, connected components, modularity-related structure, and node-level centrality metrics. Hub taxa were defined according to centrality rankings and interpreted as highly connected taxa within the inferred association network. Edges were interpreted as statistical associations rather than direct ecological interactions.
+```
+
+For paired pre/post studies:
+
+```text
+For paired pre/post analyses, networks were inferred separately for each timepoint among participants with complete paired samples. Network comparisons were interpreted primarily as exploratory because standard microbial association network methods do not automatically account for within-subject dependence unless a paired-aware permutation or modeling strategy is implemented.
+```
+
+---
+
+## 19. Suggested workflow summary
+
+```text
+Processed phyloseq object
+↓
+Select taxonomic rank and already documented filtering criteria
+↓
+Construct network with NetCoMi or SPIEC-EASI
+↓
+Analyze topology and centrality with NetCoMi / igraph
+↓
+Compare networks by group or timepoint
+↓
+Export edge and node tables
+↓
+Interpret associations conservatively
+```
+
+---
+
+## 20. References and useful resources
+
+- Peschel S, Müller CL, von Mutius E, Boulesteix AL, Depner M. NetCoMi: network construction and comparison for microbiome data in R. *Briefings in Bioinformatics*. 2021;22(4):bbaa290. https://doi.org/10.1093/bib/bbaa290
+- NetCoMi documentation: https://netcomi.de/
+- Kurtz ZD, Müller CL, Miraldi ER, Littman DR, Blaser MJ, Bonneau RA. Sparse and compositionally robust inference of microbial ecological networks. *PLoS Computational Biology*. 2015;11(5):e1004226. https://doi.org/10.1371/journal.pcbi.1004226
+- SpiecEasi GitHub repository: https://github.com/zdk123/SpiecEasi
+- Matchado MS, Lauber M, Reitmeier S, et al. Network analysis methods for studying microbial communities: A mini review. *Computational and Structural Biotechnology Journal*. 2021;19:2687–2698. https://doi.org/10.1016/j.csbj.2021.05.001
+- igraph R package: https://igraph.org/r/

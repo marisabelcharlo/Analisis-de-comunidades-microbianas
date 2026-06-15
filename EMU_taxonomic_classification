@@ -1,0 +1,723 @@
+# EMU 16S rRNA Taxonomic Classification Pipeline
+
+This document describes how to install and run **EMU** for 16S rRNA taxonomic profiling, including how to download prebuilt databases such as SILVA, how to build a custom eHOMD database, how to run EMU on long-read and short-read data, and how to import EMU outputs into R for downstream analysis.
+
+EMU is designed for species-level taxonomic profiling of 16S rRNA reads. It was developed primarily for full-length 16S Nanopore reads, but it can also be used with short-read data by specifying the appropriate read type.
+
+---
+
+## 1. Recommended project structure
+
+A clean folder structure helps avoid mixing raw reads, filtered reads, database files, and EMU outputs.
+
+```bash
+Long_reads_Saliva_16S/
+├── raw_fastq/
+├── trimmed_fastq/
+├── filtered_fastq/
+├── emu_databases/
+│   ├── silva/
+│   └── eHOMD_EMU_DB/
+├── emu_outputs/
+│   ├── long_reads_eHOMD/
+│   ├── long_reads_silva/
+│   └── short_reads_eHOMD/
+└── metadata/
+```
+
+Suggested principle:
+
+- Keep original FASTQ files unchanged.
+- Run trimming and filtering in separate output folders.
+- Keep each EMU database in its own folder.
+- Keep EMU outputs separated by database and read type.
+
+---
+
+## 2. Install EMU
+
+EMU can be installed with Conda/Bioconda. Using a dedicated environment is recommended.
+
+```bash
+conda create -n EMU -c conda-forge -c bioconda emu minimap2 python=3.7 -y
+conda activate EMU
+```
+
+Check that EMU is available:
+
+```bash
+emu --help
+emu abundance --help
+```
+
+Alternative installation, if needed:
+
+```bash
+pip install osfclient
+```
+
+`osfclient` is used below to download EMU prebuilt databases from OSF.
+
+---
+
+## 3. Input files accepted by EMU
+
+EMU can be run with FASTA or FASTQ input files.
+
+Common formats:
+
+```text
+sample.fa
+sample.fasta
+sample.fq
+sample.fastq
+```
+
+For compressed files such as `.fastq.gz`, test your local EMU version with one sample first. If the run fails, decompress before running EMU:
+
+```bash
+gunzip -c sample.fastq.gz > sample.fastq
+```
+
+For Oxford Nanopore full-length 16S reads, it is common to use quality- and length-filtered FASTQ files, for example reads filtered around the expected 16S amplicon length.
+
+---
+
+## 4. Download a prebuilt EMU database
+
+EMU provides prebuilt databases through OSF. The default EMU database can be downloaded as `emu.tar`. Alternative databases include SILVA and SILVA 138.2.
+
+### 4.1 Download the default EMU database
+
+```bash
+conda activate EMU
+pip install osfclient
+
+export EMU_DATABASE_DIR="$HOME/emu_databases/default_emu"
+mkdir -p "$EMU_DATABASE_DIR"
+cd "$EMU_DATABASE_DIR"
+
+osf -p 56uf7 fetch osfstorage/emu-prebuilt/emu.tar
+tar -xvf emu.tar
+```
+
+Expected files:
+
+```text
+species_taxid.fasta
+taxonomy.tsv
+```
+
+### 4.2 Download the SILVA prebuilt database
+
+```bash
+conda activate EMU
+pip install osfclient
+
+export EMU_PREBUILT_DB="silva"
+export EMU_DATABASE_DIR="$HOME/emu_databases/silva"
+mkdir -p "$EMU_DATABASE_DIR"
+cd "$EMU_DATABASE_DIR"
+
+osf -p 56uf7 fetch osfstorage/emu-prebuilt/${EMU_PREBUILT_DB}.tar
+tar -xvf ${EMU_PREBUILT_DB}.tar
+```
+
+Expected files may include:
+
+```text
+species_taxid.fasta
+taxonomy.tsv
+taxonomy_split.tsv
+```
+---
+
+## 5. Build a custom eHOMD database for EMU
+
+This section builds a custom EMU-compatible database using eHOMD 16S rRNA reference sequences and the eHOMD taxonomy table.
+
+### 5.1 Prepare the working directory
+
+```bash
+conda activate EMU
+
+mkdir -p "$HOME/emu_databases/eHOMD_build"
+cd "$HOME/emu_databases/eHOMD_build"
+```
+
+Download the following files from eHOMD:
+
+```text
+HOMD_16S_rRNA_RefSeq_V16.03_full.fasta
+HOMD_taxon_table2026-02-20_1771618639.txt
+```
+
+The exact file names may change with future eHOMD releases. Keep the release/version number in the file name whenever possible.
+
+---
+
+### 5.2 Prepare `taxonomy.tsv`
+
+The eHOMD taxonomy file may contain an initial descriptive line before the actual table header. Remove that line:
+
+```bash
+tail -n +2 HOMD_taxon_table2026-02-20_1771618639.txt > taxonomy.tsv
+```
+
+Check the first lines:
+
+```bash
+head -n 3 taxonomy.tsv
+```
+
+Expected structure:
+
+```text
+tax_id    Domain    Phylum    Class    Order    Family    Genus    Species    Subspecies
+HMT-001   Bacteria  ...
+```
+
+If the first column is named differently, for example `HMT-ID`, rename it to `tax_id` manually or with `awk`.
+
+EMU requires numeric taxonomic IDs. Convert `HMT-580` to `580` in the first column:
+
+```bash
+awk 'BEGIN{FS=OFS="\t"} NR==1 {print; next} NR>1 {gsub("HMT-", "", $1); print}' taxonomy.tsv \
+  > taxonomy_numeric.tsv
+```
+
+Check the result:
+
+```bash
+head -n 3 taxonomy_numeric.tsv
+```
+
+Expected example:
+
+```text
+tax_id    Domain    Phylum    Class    Order    Family    Genus    Species    Subspecies
+001       Bacteria  ...
+580       Bacteria  ...
+```
+
+The leading zeros are acceptable as text IDs, but for consistency with the sequence-to-taxonomy map it is often cleaner to remove leading zeros:
+
+```bash
+awk 'BEGIN{FS=OFS="\t"} NR==1 {print; next} NR>1 {$1=$1+0; print}' taxonomy_numeric.tsv \
+  > taxonomy_numeric_nozeros.tsv
+```
+
+Use `taxonomy_numeric_nozeros.tsv` in the final database build.
+
+---
+
+### 5.3 Prepare `seq2tax.map.tsv`
+
+EMU needs a two-column, tab-separated file mapping each sequence ID in the FASTA file to a numeric taxonomic ID.
+
+The FASTA headers usually look like this:
+
+```text
+>HMT-580_16S000002 ...
+```
+
+The sequence ID is:
+
+```text
+HMT-580_16S000002
+```
+
+The corresponding taxonomic ID should be:
+
+```text
+580
+```
+
+Create the mapping file:
+
+```bash
+grep "^>" HOMD_16S_rRNA_RefSeq_V16.03_full.fasta \
+  | sed 's/^>//' \
+  | awk 'BEGIN{FS=" "; OFS="\t"} {seq=$1; tax=seq; sub(/_.*/, "", tax); gsub("HMT-", "", tax); tax=tax+0; print seq, tax}' \
+  > seq2tax.map.tsv
+```
+
+Check the output:
+
+```bash
+head seq2tax.map.tsv
+```
+
+Expected example:
+
+```text
+HMT-580_16S000002    580
+HMT-001_16S000001    1
+```
+
+Check that all tax IDs in `seq2tax.map.tsv` are present in the taxonomy file:
+
+```bash
+comm -23 \
+  <(cut -f2 seq2tax.map.tsv | sort -n | uniq) \
+  <(tail -n +2 taxonomy_numeric_nozeros.tsv | cut -f1 | sort -n | uniq)
+```
+
+If the command returns no output, all mapped tax IDs are present in the taxonomy table.
+
+---
+
+### 5.4 Build the custom eHOMD EMU database
+
+```bash
+emu build-database eHOMD_EMU_DB \
+  --sequences HOMD_16S_rRNA_RefSeq_V16.03_full.fasta \
+  --seq2tax seq2tax.map.tsv \
+  --taxonomy-list taxonomy_numeric_nozeros.tsv
+```
+
+Check the database folder:
+
+```bash
+ls eHOMD_EMU_DB
+```
+
+Expected files:
+
+```text
+species_taxid.fasta
+taxonomy.tsv
+```
+
+Move the database to your main database directory:
+
+```bash
+mkdir -p "$HOME/emu_databases"
+mv eHOMD_EMU_DB "$HOME/emu_databases/"
+```
+
+Final path:
+
+```text
+$HOME/emu_databases/eHOMD_EMU_DB
+```
+
+---
+
+## 6. Test the custom database
+
+Run EMU on a small control FASTA or on the original eHOMD FASTA to confirm that the database works.
+
+```bash
+emu abundance HOMD_16S_rRNA_RefSeq_V16.03_full.fasta \
+  --db "$HOME/emu_databases/eHOMD_EMU_DB" \
+  --type map-ont \
+  --threads 8 \
+  --output-dir test_eHOMD_db \
+  --output-basename eHOMD_control \
+  --keep-counts
+```
+
+Expected output:
+
+```text
+test_eHOMD_db/eHOMD_control_rel-abundance.tsv
+```
+
+If this runs without errors, the custom database is correctly formatted.
+
+---
+
+## 7. Run EMU on long-read ONT 16S data
+
+For Oxford Nanopore full-length 16S reads, use:
+
+```bash
+--type map-ont
+```
+
+This is the default EMU long-read ONT mode, but it is good practice to state it explicitly.
+
+### 7.1 Run one sample
+
+```bash
+conda activate EMU
+
+DB_PATH="$HOME/emu_databases/eHOMD_EMU_DB"
+OUTPUT_DIR="$HOME/Long_reads_Saliva_16S/emu_outputs/long_reads_eHOMD"
+THREADS=16
+
+mkdir -p "$OUTPUT_DIR"
+
+emu abundance sample_filtered.fastq \
+  --db "$DB_PATH" \
+  --type map-ont \
+  --output-dir "$OUTPUT_DIR" \
+  --output-basename sample_filtered \
+  --keep-files \
+  --keep-counts \
+  --keep-read-assignments \
+  --output-unclassified \
+  --min-abundance \
+  --threads "$THREADS"
+```
+
+Main output:
+
+```text
+sample_filtered_rel-abundance.tsv
+```
+
+---
+
+### 7.3 Batch run for barcode folders
+
+Use this when each barcode is a folder containing one or more FASTQ files.
+
+```bash
+#!/bin/bash
+set -euo pipefail
+
+BASE_DIR="$HOME/Long_reads_Saliva_16S/fastq_pass/Barcodes_Marisabel"
+OUTPUT_DIR="$HOME/Long_reads_Saliva_16S/emu_outputs/long_reads_eHOMD"
+DB_PATH="$HOME/emu_databases/eHOMD_EMU_DB"
+THREADS=16
+
+mkdir -p "$OUTPUT_DIR"
+
+for folder in "$BASE_DIR"/barcode*; do
+
+    sample=$(basename "$folder")
+    echo "Processing $sample"
+
+    emu abundance "$folder"/*.fastq \
+        --db "$DB_PATH" \
+        --type map-ont \
+        --output-dir "$OUTPUT_DIR" \
+        --output-basename "$sample" \
+        --keep-files \
+        --keep-counts \
+        --keep-read-assignments \
+        --output-unclassified \
+        --min-abundance \
+        --threads "$THREADS"
+
+    echo "Finished $sample"
+
+done
+```
+
+---
+
+## 8. Run EMU on short-read 16S data
+
+For short-read data, use:
+
+```bash
+--type sr
+```
+
+EMU supports both single-end and paired-end short-read inputs.
+
+---
+
+### 8.1 Single-end short-read FASTQ
+
+```bash
+emu abundance sample_R1.fastq \
+  --db "$HOME/emu_databases/eHOMD_EMU_DB" \
+  --type sr \
+  --output-dir short_read_outputs \
+  --output-basename sample_R1 \
+  --keep-counts \
+  --min-abundance \
+  --threads 16
+```
+
+---
+
+### 8.2 Paired-end short-read FASTQ
+
+```bash
+emu abundance sample_R1.fastq sample_R2.fastq \
+  --db "$HOME/emu_databases/eHOMD_EMU_DB" \
+  --type sr \
+  --output-dir short_read_outputs \
+  --output-basename sample \
+  --keep-counts \
+  --min-abundance \
+  --threads 16
+```
+
+---
+
+### 8.3 Batch run for FASTA files
+
+Use this if your short-read workflow produced dereplicated or processed `.fa` files.
+
+```bash
+#!/bin/bash
+set -euo pipefail
+
+BASE_DIR="$HOME/Finatag_derep_16S_SR"
+OUTPUT_DIR="$BASE_DIR/Feces_oral"
+DB_PATH="$HOME/emu_databases/eHOMD_EMU_DB"
+THREADS=50
+
+mkdir -p "$OUTPUT_DIR"
+
+for fa in "$BASE_DIR"/*.fa; do
+
+    sample=$(basename "$fa" .fa)
+    echo "Processing $sample"
+
+    emu abundance "$fa" \
+        --db "$DB_PATH" \
+        --type sr \
+        --output-dir "$OUTPUT_DIR" \
+        --output-basename "$sample" \
+        --keep-files \
+        --keep-counts \
+        --keep-read-assignments \
+        --output-unclassified \
+        --min-abundance \
+        --threads "$THREADS"
+
+    echo "Finished $sample"
+
+done
+```
+
+---
+
+## 9. Important EMU output files
+
+The most important output file is:
+
+```text
+*_rel-abundance.tsv
+```
+
+This file contains the estimated taxonomic profile for each sample.
+
+If `--keep-counts` is used, the output also includes estimated counts. These are not raw observed counts; they are EMU-estimated counts derived from the abundance model.
+
+If `--keep-read-assignments` is used, EMU also saves per-read assignment information. This is useful for checking ambiguous assignments or debugging specific samples, but it can generate large files.
+
+If `--output-unclassified` is used, EMU writes additional files for reads that were unmapped, filtered, or unclassified.
+
+---
+
+## 10. Combine EMU outputs using EMU itself
+
+EMU has a built-in function to combine multiple `*_rel-abundance.tsv` files from one output directory.
+
+For species-level output:
+
+```bash
+emu combine-outputs "$OUTPUT_DIR" species
+```
+
+For tax ID-level output:
+
+```bash
+emu combine-outputs "$OUTPUT_DIR" tax_id
+```
+
+This creates combined tables inside the same output directory.
+
+---
+
+## 11. Import EMU outputs into R
+
+The following R workflow imports all `*_rel-abundance.tsv` files, combines estimated counts across samples, adds taxonomy, and creates a `phyloseq` object.
+
+### 11.1 Load packages
+
+```r
+library(tidyverse)
+library(phyloseq)
+library(readxl)
+```
+
+---
+
+### 11.2 Define paths
+
+```r
+emu_path <- "/Users/marisabelcharlocabrera/Library/CloudStorage/OneDrive-Personal/Long_Reads_16s_Saliva/EMU_outputs_2026/emu_output_lr_emu_ehomd"
+metadata_path <- "/Users/marisabelcharlocabrera/Library/CloudStorage/OneDrive-Personal/Long_Reads_16s_Saliva/Barcoding_Merged_Timepoint.xlsx"
+```
+
+---
+
+### 11.3 Read and combine EMU count tables
+
+This version assumes that EMU was run with `--keep-counts`, so the column `estimated.counts` is present.
+
+```r
+files <- list.files(
+  emu_path,
+  pattern = "_rel-abundance.tsv$",
+  full.names = TRUE
+)
+
+if (length(files) == 0) {
+  stop("No EMU rel-abundance files were found.")
+}
+
+lista_tablas <- purrr::map(files, function(file) {
+
+  sample_name <- basename(file) %>%
+    stringr::str_remove("_rel-abundance.tsv$")
+
+  df <- read.delim(
+    file,
+    header = TRUE,
+    sep = "\t",
+    quote = "",
+    stringsAsFactors = FALSE,
+    check.names = FALSE
+  )
+
+  if (!"estimated.counts" %in% colnames(df)) {
+    stop(paste("The file does not contain estimated.counts. Re-run EMU with --keep-counts:", file))
+  }
+
+  df %>%
+    dplyr::select(
+      tax_id,
+      dplyr::any_of(c("Domain", "Phylum", "Class", "Order", "Family", "Genus", "Species", "Subspecies")),
+      estimated_counts = estimated.counts
+    ) %>%
+    dplyr::rename(!!sample_name := estimated_counts)
+})
+
+conteo_tabla <- purrr::reduce(
+  lista_tablas,
+  dplyr::full_join,
+  by = c("tax_id", "Domain", "Phylum", "Class", "Order", "Family", "Genus", "Species", "Subspecies")
+)
+
+conteo_tabla <- conteo_tabla %>%
+  dplyr::mutate(across(where(is.numeric), ~ tidyr::replace_na(.x, 0)))
+
+output_file <- file.path(emu_path, "EMU_combined_counts_taxonomy.csv")
+readr::write_csv(conteo_tabla, output_file)
+```
+
+---
+
+### 11.4 Read and clean metadata
+
+```r
+sample_meta <- readxl::read_excel(metadata_path)
+
+sample_meta <- sample_meta %>%
+  mutate(
+    Barcode = stringr::str_remove(Barcode, "_duplicado"),
+    Barcode = stringr::str_replace(Barcode, "barcode(\\d)$", "barcode0\\1")
+  )
+```
+
+If your EMU output names include length-filter suffixes, remove them from the count table column names:
+
+```r
+colnames(conteo_tabla) <- stringr::str_remove(
+  colnames(conteo_tabla),
+  "_1300-1700bp"
+)
+```
+
+---
+
+### 11.5 Create the OTU/count matrix
+
+Identify sample columns as all columns that are not taxonomy columns.
+
+```r
+taxonomy_cols <- c(
+  "tax_id", "Domain", "Phylum", "Class", "Order",
+  "Family", "Genus", "Species", "Subspecies"
+)
+
+sample_cols <- setdiff(colnames(conteo_tabla), taxonomy_cols)
+
+otu_mat <- conteo_tabla %>%
+  dplyr::select(dplyr::all_of(sample_cols)) %>%
+  as.matrix()
+
+otu_mat <- round(otu_mat)
+rownames(otu_mat) <- conteo_tabla$tax_id
+
+otu_mat[is.na(otu_mat)] <- 0
+```
+
+Check dimensions:
+
+```r
+dim(otu_mat)
+otu_mat[1:5, 1:min(5, ncol(otu_mat))]
+```
+
+---
+
+### 11.6 Create the taxonomy matrix
+
+```r
+tax_cols <- c("Domain", "Phylum", "Class", "Order", "Family", "Genus", "Species")
+
+tax_mat <- conteo_tabla %>%
+  dplyr::select(dplyr::all_of(tax_cols)) %>%
+  as.matrix()
+
+rownames(tax_mat) <- conteo_tabla$tax_id
+```
+
+---
+
+### 11.7 Match metadata to the OTU matrix
+
+```r
+sample_meta_df <- sample_meta %>%
+  filter(Barcode %in% colnames(otu_mat)) %>%
+  arrange(match(Barcode, colnames(otu_mat))) %>%
+  as.data.frame()
+
+rownames(sample_meta_df) <- sample_meta_df$Barcode
+```
+
+Check that sample order matches exactly:
+
+```r
+stopifnot(all(rownames(sample_meta_df) == colnames(otu_mat)))
+```
+
+---
+
+### 11.8 Create the phyloseq object
+
+```r
+otu_tab <- phyloseq::otu_table(otu_mat, taxa_are_rows = TRUE)
+tax_tab <- phyloseq::tax_table(tax_mat)
+meta_tab <- phyloseq::sample_data(sample_meta_df)
+
+ps <- phyloseq::phyloseq(otu_tab, tax_tab, meta_tab)
+ps
+```
+
+Expected structure:
+
+```text
+phyloseq-class experiment-level object
+otu_table()   OTU Table:         [ taxa x samples ]
+sample_data() Sample Data:       [ samples x variables ]
+tax_table()   Taxonomy Table:    [ taxa x ranks ]
+```
+
+Save the object:
+
+```r
+saveRDS(ps, file.path(emu_path, "phyloseq_EMU_eHOMD.rds"))
+```
+---
